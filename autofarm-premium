@@ -1,0 +1,1115 @@
+-- [[ GANKUNZ AUTO FARM - VIOLENCE DISTRICT (FIXED MULTI-EXECUTE) ]]
+-- UI Library: ModernV2 (https://raw.githubusercontent.com/systemyour2/ajaxx/refs/heads/main/uigan.lua)
+-- Asset Icon ID: rbxassetid://76222344614410
+
+-- =========================================================================
+-- [0] ANTI DOUBLE-EXECUTION GUARD (PENCEGAH EKSEKUSI GANDA)
+-- =========================================================================
+if getgenv and getgenv().GANKUNZ_LOADED then
+    warn("[GanKunZ] Script sudah berjalan! Mencegah eksekusi ganda.")
+    return
+end
+
+if getgenv then
+    getgenv().GANKUNZ_LOADED = true
+end
+
+-- Tunggu game benar-benar selesai loading
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+-- =========================================================================
+-- [1] SERVICES & UTILITIES
+-- =========================================================================
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = workspace or game:GetService("Workspace")
+local VirtualUser = game:GetService("VirtualUser")
+
+local LocalPlayer = Players.LocalPlayer
+while not LocalPlayer do
+    LocalPlayer = Players.LocalPlayer
+    task.wait(0.1)
+end
+
+local PlaceId = game.PlaceId
+local CurrentJobId = game.JobId
+
+local function safeWait(sec)
+    return (task and task.wait and task.wait(sec)) or wait(sec)
+end
+
+local function safeSpawn(fn)
+    return (task and task.spawn and task.spawn(fn)) or spawn(fn)
+end
+
+-- Container untuk membersihkan koneksi saat unload/re-execute
+local ActiveConnections = {}
+
+-- =========================================================================
+-- [2] EXECUTOR COMPATIBILITY WRAPPERS & TELEPORT QUEUE
+-- =========================================================================
+local httpRequest = (syn and syn.request) 
+    or (http and http.request) 
+    or (fluxus and fluxus.request) 
+    or (krnl and krnl.request) 
+    or request 
+    or http_request
+
+local function getExecutorName()
+    if identifyexecutor then
+        return identifyexecutor()
+    elseif getexecutorname then
+        return getexecutorname()
+    end
+    return "Unknown Executor"
+end
+
+local SCRIPT_RAW_URL = (getgenv and getgenv().GanKunZ_URL) or "https://raw.githubusercontent.com/systemyour2/ajaxx/refs/heads/main/autofarm-premium.lua"
+local SCRIPT_LOADSTRING = string.format('loadstring(game:HttpGet("%s"))()', SCRIPT_RAW_URL)
+
+local TeleportQueued = false
+local function safeQueueOnTeleport(scriptSource)
+    if TeleportQueued then return true end -- Mencegah antrean ganda berulang
+    local code = scriptSource or SCRIPT_LOADSTRING
+    local queueFunc = (getgenv and getgenv().queue_on_teleport)
+        or queue_on_teleport 
+        or (syn and syn.queue_on_teleport) 
+        or (fluxus and fluxus.queue_on_teleport)
+        or queueonteleport
+
+    if queueFunc and type(queueFunc) == "function" then
+        local success = pcall(function()
+            queueFunc(code)
+        end)
+        if success then
+            TeleportQueued = true
+        end
+        return success
+    end
+    return false
+end
+
+-- =========================================================================
+-- [3] CONFIGURATION & STATE
+-- =========================================================================
+local Config = {
+    AutoFarm = true,
+    AutoHopAfterEscape = true,
+    DisableKillerChance = true,
+    HopIfKiller = true,
+    InstantFinish = true,
+    GateTweenSpeed = 100,
+    MinPlayers = 2,
+    MaxPlayers = 4,
+    EnableWebhook = false,
+    WebhookURL = "",
+    AntiAFK = true,
+    NoClip = true,
+    AutoExecuteOnHop = true,
+}
+
+local ScriptRunning = true
+local BeatSurvivorDone = false
+local LastFinishPos = nil
+local LastRole = "Unknown"
+local NoClipActive = true
+local isHopping = false
+
+-- =========================================================================
+-- [4] ATTRIBUTES LOCAL STORAGE
+-- =========================================================================
+local ATTRIBUTES_FILE = "VD_AutoFarm_Attributes.json"
+
+local function loadCachedAttributes()
+    if isfile and isfile(ATTRIBUTES_FILE) then
+        local success, result = pcall(function()
+            return HttpService:JSONDecode(readfile(ATTRIBUTES_FILE))
+        end)
+        if success and type(result) == "table" and result.UserId == LocalPlayer.UserId then
+            return result
+        end
+    end
+    return {
+        UserId = LocalPlayer.UserId,
+        Level = 0,
+        SIN = 0,
+        EXP = 0,
+        Screws = 0,
+        Gears = 0,
+        KillerChance = 0,
+        UpdatedAt = os.time()
+    }
+end
+
+local function saveCachedAttributes(data)
+    if writefile then
+        pcall(function()
+            data.UserId = LocalPlayer.UserId
+            data.UpdatedAt = os.time()
+            writefile(ATTRIBUTES_FILE, HttpService:JSONEncode(data))
+        end)
+    end
+end
+
+local CachedStats = loadCachedAttributes()
+
+-- =========================================================================
+-- [5] SERVER HOP BLACKLIST ENGINE
+-- =========================================================================
+local HOP_BLACKLIST_FILE = "ServerHop.txt"
+local BLACKLIST_EXPIRE_SECONDS = 600
+
+local function readBlacklistedServers()
+    local blacklisted = {}
+    local currentTime = os.time()
+
+    if isfile and isfile(HOP_BLACKLIST_FILE) then
+        local success, content = pcall(function()
+            return readfile(HOP_BLACKLIST_FILE)
+        end)
+        if success and content then
+            for line in string.gmatch(content, "[^\r\n]+") do
+                local serverId, addedTimeStr = string.match(line, "^([^|]+)|(%d+)$")
+                if serverId and addedTimeStr then
+                    local addedTime = tonumber(addedTimeStr) or 0
+                    if (currentTime - addedTime) < BLACKLIST_EXPIRE_SECONDS then
+                        blacklisted[serverId] = addedTime
+                    end
+                end
+            end
+        end
+    end
+    return blacklisted
+end
+
+local function addServerToBlacklist(serverId)
+    if not writefile then return end
+    local blacklisted = readBlacklistedServers()
+    blacklisted[serverId] = os.time()
+
+    local lines = {}
+    for id, timeVal in pairs(blacklisted) do
+        table.insert(lines, id .. "|" .. tostring(timeVal))
+    end
+    pcall(function()
+        writefile(HOP_BLACKLIST_FILE, table.concat(lines, "\n"))
+    end)
+end
+
+-- =========================================================================
+-- [6] ANTI-AFK SYSTEM
+-- =========================================================================
+safeSpawn(function()
+    pcall(function()
+        if getconnections then
+            for _, conn in ipairs(getconnections(LocalPlayer.Idled)) do
+                if conn.Disable then
+                    conn:Disable()
+                elseif conn.Disconnect then
+                    conn:Disconnect()
+                end
+            end
+        end
+    end)
+
+    local idledConn = LocalPlayer.Idled:Connect(function()
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:Button2Down(Vector2.new(0, 0), Workspace.CurrentCamera.CFrame)
+            task.wait(0.1)
+            VirtualUser:Button2Up(Vector2.new(0, 0), Workspace.CurrentCamera.CFrame)
+        end)
+    end)
+    table.insert(ActiveConnections, idledConn)
+
+    task.spawn(function()
+        while ScriptRunning do
+            task.wait(300)
+            if Config.AntiAFK and ScriptRunning then
+                pcall(function()
+                    VirtualUser:CaptureController()
+                    VirtualUser:Button2Down(Vector2.new(0, 0), Workspace.CurrentCamera.CFrame)
+                    task.wait(0.1)
+                    VirtualUser:Button2Up(Vector2.new(0, 0), Workspace.CurrentCamera.CFrame)
+                end)
+            end
+        end
+    end)
+end)
+
+-- =========================================================================
+-- [7] NOCLIP SYSTEM
+-- =========================================================================
+local function applyNoClip(char)
+    if not char then return end
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") and part.CanCollide then
+            pcall(function()
+                part.CanCollide = false
+            end)
+        end
+    end
+end
+
+local noclipConn = RunService.Stepped:Connect(function()
+    if NoClipActive and LocalPlayer.Character and ScriptRunning then
+        applyNoClip(LocalPlayer.Character)
+    end
+end)
+table.insert(ActiveConnections, noclipConn)
+
+local charAddedConn = LocalPlayer.CharacterAdded:Connect(function(char)
+    task.wait(0.5)
+    if NoClipActive and ScriptRunning then
+        applyNoClip(char)
+    end
+end)
+table.insert(ActiveConnections, charAddedConn)
+
+-- =========================================================================
+-- [8] UI LIBRARY LOAD & FLOATING TOGGLE
+-- =========================================================================
+local ModernV2 = nil
+local successLoad, errLoad = pcall(function()
+    return loadstring(game:HttpGet("https://raw.githubusercontent.com/systemyour2/ajaxx/refs/heads/main/uigan.lua"))()
+end)
+
+if successLoad and type(errLoad) == "table" then
+    ModernV2 = errLoad
+    ModernV2.UnloadEnabled = true
+else
+    warn("[GanKunZ] ModernV2 UI load warning: " .. tostring(errLoad))
+end
+
+local function Notify(title, message, duration)
+    pcall(function()
+        if ModernV2 and ModernV2.Notifier and ModernV2.Notifier.new then
+            ModernV2.Notifier.new({
+                Title = title or "GanKunZ",
+                Content = message or "",
+                Duration = duration or 3,
+                Icon = "lucide:bell"
+            })
+        elseif game:GetService("StarterGui") then
+            game:GetService("StarterGui"):SetCore("SendNotification", {
+                Title = title or "GanKunZ",
+                Text = message or "",
+                Duration = duration or 3
+            })
+        end
+    end)
+end
+
+local ServerHop
+local SendWebhookNotification
+
+local Window
+if ModernV2 and ModernV2.CreateWindow then
+    local okWin, resWin = pcall(function()
+        return ModernV2:CreateWindow({
+            Name = "GanKunZ",
+            Title = "GanKunZ",
+            Content = "Violence District",
+            Logo = "rbxassetid://76222344614410",
+            Color = Color3.fromRGB(168, 85, 247),
+            ConfigFolder = "GanKunZConfigs",
+            Search = false,
+            ShowUser = true,
+            TextGradient = true,
+            NotifyOnCallbackError = false,
+        })
+    end)
+    if okWin and resWin then
+        Window = resWin
+    end
+end
+
+-- Floating Button
+local FloatingGui = nil
+pcall(function()
+    local gethui = gethui or function() return game:GetService("CoreGui") end
+    local targetParent
+    pcall(function() targetParent = gethui() end)
+    if not targetParent then
+        pcall(function() targetParent = game:GetService("CoreGui") end)
+    end
+    if not targetParent then
+        targetParent = LocalPlayer:WaitForChild("PlayerGui")
+    end
+
+    for _, oldGui in ipairs(targetParent:GetChildren()) do
+        if oldGui.Name == "GanKunZ_FloatingToggle" then
+            oldGui:Destroy()
+        end
+    end
+
+    FloatingGui = Instance.new("ScreenGui")
+    FloatingGui.Name = "GanKunZ_FloatingToggle"
+    FloatingGui.ResetOnSpawn = false
+    FloatingGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    FloatingGui.DisplayOrder = 999999
+    FloatingGui.Parent = targetParent
+
+    local floatBtn = Instance.new("ImageButton")
+    floatBtn.Name = "CircleButton"
+    floatBtn.AnchorPoint = Vector2.new(0.5, 0.5)
+    floatBtn.Size = UDim2.new(0, 50, 0, 50)
+    floatBtn.Position = UDim2.new(0, 55, 0.45, 0)
+    floatBtn.BackgroundColor3 = Color3.fromRGB(18, 18, 26)
+    floatBtn.BackgroundTransparency = 0.1
+    floatBtn.BorderSizePixel = 0
+    floatBtn.AutoButtonColor = false
+    floatBtn.ZIndex = 100
+    floatBtn.Parent = FloatingGui
+
+    local floatCorner = Instance.new("UICorner")
+    floatCorner.CornerRadius = UDim.new(1, 0)
+    floatCorner.Parent = floatBtn
+
+    local floatStroke = Instance.new("UIStroke")
+    floatStroke.Color = Color3.fromRGB(168, 85, 247)
+    floatStroke.Thickness = 2
+    floatStroke.Transparency = 0
+    floatStroke.Parent = floatBtn
+
+    local floatIcon = Instance.new("ImageLabel")
+    floatIcon.Name = "LogoIcon"
+    floatIcon.AnchorPoint = Vector2.new(0.5, 0.5)
+    floatIcon.Position = UDim2.new(0.5, 0, 0.5, 0)
+    floatIcon.Size = UDim2.new(0.68, 0, 0.68, 0)
+    floatIcon.BackgroundTransparency = 1
+    floatIcon.Image = "rbxassetid://76222344614410"
+    floatIcon.ScaleType = Enum.ScaleType.Fit
+    floatIcon.ZIndex = 101
+    floatIcon.Parent = floatBtn
+
+    local isDragging = false
+    local dragStartPos = nil
+    local initialBtnPos = nil
+    local movedDistance = 0
+    local DRAG_THRESHOLD = 7
+
+    floatBtn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            isDragging = true
+            movedDistance = 0
+            dragStartPos = input.Position
+            initialBtnPos = floatBtn.Position
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if isDragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStartPos
+            movedDistance = delta.Magnitude
+            if movedDistance > DRAG_THRESHOLD then
+                local cam = Workspace.CurrentCamera
+                local viewSize = cam and cam.ViewportSize or Vector2.new(1280, 720)
+                local halfSize = 25
+                local targetX = math.clamp(initialBtnPos.X.Offset + delta.X, halfSize, viewSize.X - halfSize)
+                local targetY = math.clamp(initialBtnPos.Y.Offset + delta.Y, halfSize, viewSize.Y - halfSize)
+                floatBtn.Position = UDim2.new(0, targetX, 0, targetY)
+            end
+        end
+    end)
+
+    local function toggleWindowMenu()
+        pcall(function()
+            local bounceDown = TweenService:Create(floatBtn, TweenInfo.new(0.08, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                Size = UDim2.new(0, 42, 0, 42)
+            })
+            local bounceUp = TweenService:Create(floatBtn, TweenInfo.new(0.14, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+                Size = UDim2.new(0, 50, 0, 50)
+            })
+            bounceDown:Play()
+            bounceDown.Completed:Connect(function()
+                bounceUp:Play()
+            end)
+        end)
+
+        if Window and Window.ToggleInterface then
+            Window:ToggleInterface()
+        elseif ModernV2 and ModernV2.FireKeybind then
+            ModernV2:FireKeybind()
+        elseif Window and Window.Signal then
+            Window.Signal:SetValue(not Window.Signal:GetValue())
+        elseif ModernV2 and ModernV2.ScreenGui then
+            ModernV2.ScreenGui.Enabled = not ModernV2.ScreenGui.Enabled
+        end
+    end
+
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            if isDragging then
+                isDragging = false
+                if movedDistance <= DRAG_THRESHOLD then
+                    toggleWindowMenu()
+                end
+            end
+        end
+    end)
+end)
+
+-- =========================================================================
+-- [8.2] MENU TABS & SECTIONS
+-- =========================================================================
+if Window and Window.AddTab then
+    local FarmTab = Window:AddTab({
+        Name = "Auto Farm",
+        Icon = "crosshairs",
+        Type = "Double",
+    })
+
+    local FarmSection = FarmTab:AddSection({
+        Name = "Core Auto Farm",
+        Position = "left",
+    })
+
+    FarmSection:AddToggle({
+        Name = "Auto Farm",
+        Default = Config.AutoFarm,
+        Callback = function(val)
+            Config.AutoFarm = val
+            if not val then
+                BeatSurvivorDone = false
+                LastFinishPos = nil
+            end
+        end
+    })
+
+    FarmSection:AddToggle({
+        Name = "Auto Hop After Escape",
+        Default = Config.AutoHopAfterEscape,
+        Callback = function(val)
+            Config.AutoHopAfterEscape = val
+        end
+    })
+
+    FarmSection:AddToggle({
+        Name = "Disable Killer Chance",
+        Default = Config.DisableKillerChance,
+        Callback = function(val)
+            Config.DisableKillerChance = val
+        end
+    })
+
+    FarmSection:AddToggle({
+        Name = "Hop If Killer",
+        Default = Config.HopIfKiller,
+        Callback = function(val)
+            Config.HopIfKiller = val
+        end
+    })
+
+    FarmSection:AddToggle({
+        Name = "Instant Finish Teleport",
+        Default = Config.InstantFinish,
+        Callback = function(val)
+            Config.InstantFinish = val
+        end
+    })
+
+    FarmSection:AddSlider({
+        Name = "Tween Speed",
+        Default = Config.GateTweenSpeed,
+        Min = 20,
+        Max = 300,
+        Rounding = 0,
+        Callback = function(val)
+            Config.GateTweenSpeed = val
+        end
+    })
+
+    local ExploitSection = FarmTab:AddSection({
+        Name = "Protections & Exploits",
+        Position = "right",
+    })
+
+    ExploitSection:AddToggle({
+        Name = "Anti-AFK System",
+        Default = Config.AntiAFK,
+        Callback = function(val)
+            Config.AntiAFK = val
+        end
+    })
+
+    ExploitSection:AddToggle({
+        Name = "Ghost NoClip",
+        Default = Config.NoClip,
+        Callback = function(val)
+            Config.NoClip = val
+            NoClipActive = val
+        end
+    })
+
+    ExploitSection:AddLabel("Status: Active (Violence District)")
+    ExploitSection:AddLabel("Mode: Survivor Fast Escape")
+
+    local ServerTab = Window:AddTab({
+        Name = "Server Hop",
+        Icon = "sliders-horizontal",
+        Type = "Double",
+    })
+
+    local HopConfigSection = ServerTab:AddSection({
+        Name = "Target Player Range (1-3)",
+        Position = "left",
+    })
+
+    HopConfigSection:AddSlider({
+        Name = "Min Players",
+        Default = Config.MinPlayers,
+        Min = 1,
+        Max = 4,
+        Rounding = 0,
+        Callback = function(val)
+            Config.MinPlayers = val
+        end
+    })
+
+    HopConfigSection:AddSlider({
+        Name = "Max Players",
+        Default = Config.MaxPlayers,
+        Min = 1,
+        Max = 8,
+        Rounding = 0,
+        Callback = function(val)
+            Config.MaxPlayers = val
+        end
+    })
+
+    HopConfigSection:AddToggle({
+        Name = "Auto Execute On Hop",
+        Default = Config.AutoExecuteOnHop,
+        Callback = function(val)
+            Config.AutoExecuteOnHop = val
+        end
+    })
+
+    local HopActionsSection = ServerTab:AddSection({
+        Name = "Hop Controls",
+        Position = "right",
+    })
+
+    HopActionsSection:AddButton({
+        Name = "Server Hop Now",
+        Callback = function()
+            if ServerHop then ServerHop() end
+        end
+    })
+
+    HopActionsSection:AddButton({
+        Name = "Rejoin This Server",
+        Callback = function()
+            TeleportService:TeleportToPlaceInstance(PlaceId, CurrentJobId, LocalPlayer)
+        end
+    })
+
+    HopActionsSection:AddButton({
+        Name = "Reset Blacklist Hop",
+        Callback = function()
+            pcall(function()
+                if delfile then delfile(HOP_BLACKLIST_FILE) end
+            end)
+            Notify("GanKunZ", "Blacklist ServerHop.txt di-reset!", 3)
+        end
+    })
+
+    local SettingsTab = Window:AddTab({
+        Name = "Settings",
+        Icon = "bell",
+        Type = "Double",
+    })
+
+    local WebhookSection = SettingsTab:AddSection({
+        Name = "Discord Webhook",
+        Position = "left",
+    })
+
+    WebhookSection:AddToggle({
+        Name = "Enable Webhook Log",
+        Default = Config.EnableWebhook,
+        Callback = function(val)
+            Config.EnableWebhook = val
+        end
+    })
+
+    WebhookSection:AddTextInput({
+        Name = "Webhook URL",
+        Default = Config.WebhookURL,
+        Placeholder = "https://discord.com/api/webhooks/...",
+        Callback = function(val)
+            Config.WebhookURL = val
+        end
+    })
+
+    WebhookSection:AddButton({
+        Name = "Send Test Webhook",
+        Callback = function()
+            if SendWebhookNotification then
+                SendWebhookNotification("🔔 Test Connection - GanKunZ", true)
+            end
+            Notify("GanKunZ Webhook", "Test webhook dikirim!", 3)
+        end
+    })
+
+    local MiscSection = SettingsTab:AddSection({
+        Name = "Controls & Unload",
+        Position = "right",
+    })
+
+    MiscSection:AddButton({
+        Name = "Unload GanKunZ Script",
+        Callback = function()
+            ScriptRunning = false
+            Config.AutoFarm = false
+            NoClipActive = false
+            if getgenv then
+                getgenv().GANKUNZ_LOADED = nil
+            end
+            for _, conn in ipairs(ActiveConnections) do
+                pcall(function() conn:Disconnect() end)
+            end
+            pcall(function()
+                if FloatingGui then FloatingGui:Destroy() end
+            end)
+            if ModernV2 and ModernV2.Unload then
+                pcall(function() ModernV2:Unload() end)
+            end
+            Notify("GanKunZ", "Script berhasil di-unload.", 3)
+        end
+    })
+end
+
+-- =========================================================================
+-- [9] DISCORD WEBHOOK LOGGING
+-- =========================================================================
+SendWebhookNotification = function(customTitle, isTest)
+    if not isTest and not Config.EnableWebhook then return end
+    if not Config.WebhookURL or Config.WebhookURL == "" or not string.find(Config.WebhookURL, "discord.com/api/webhooks") then
+        if isTest then
+            Notify("GanKunZ", "Webhook URL tidak valid!", 3)
+        end
+        return
+    end
+
+    safeSpawn(function()
+        pcall(function()
+            if not httpRequest then return end
+
+            local currentAttributes = LocalPlayer:GetAttributes() or {}
+            local currentLevel = tonumber(currentAttributes.Level) or CachedStats.Level or 0
+            local currentEXP = tonumber(currentAttributes.EXP) or CachedStats.EXP or 0
+            local currentScrews = tonumber(currentAttributes.Screws) or CachedStats.Screws or 0
+            local currentGears = tonumber(currentAttributes.Gears) or CachedStats.Gears or 0
+            local currentSIN = tonumber(currentAttributes.SIN) or CachedStats.SIN or 0
+
+            local expDiff = currentEXP - (CachedStats.EXP or currentEXP)
+            local screwsDiff = currentScrews - (CachedStats.Screws or currentScrews)
+            local gearsDiff = currentGears - (CachedStats.Gears or currentGears)
+
+            local embedData = {
+                ["embeds"] = {{
+                    ["title"] = customTitle or "🏆 Ronde Berhasil Selesai!",
+                    ["color"] = isTest and 0x38bdf8 or 0xa855f7,
+                    ["fields"] = {
+                        { ["name"] = "Pemain", ["value"] = LocalPlayer.DisplayName .. " (@" .. LocalPlayer.Name .. ")", ["inline"] = true },
+                        { ["name"] = "Level", ["value"] = tostring(currentLevel), ["inline"] = true },
+                        { ["name"] = "Role", ["value"] = LastRole or "Survivor", ["inline"] = true },
+                        { ["name"] = "💀 SIN", ["value"] = tostring(currentSIN), ["inline"] = true },
+                        { ["name"] = "🧪 EXP", ["value"] = string.format("%d (**%+d**)", currentEXP, expDiff), ["inline"] = true },
+                        { ["name"] = "🔩 Screws", ["value"] = string.format("%d (**%+d**)", currentScrews, screwsDiff), ["inline"] = true },
+                        { ["name"] = "⚙️ Gears", ["value"] = string.format("%d (**%+d**)", currentGears, gearsDiff), ["inline"] = true },
+                        { ["name"] = "🆔 Server ID", ["value"] = "```\n" .. tostring(CurrentJobId ~= "" and CurrentJobId or "Singleplayer") .. "\n```", ["inline"] = false }
+                    },
+                    ["footer"] = { ["text"] = "GanKunZ · Violence District Auto-Farm (" .. getExecutorName() .. ")" },
+                    ["timestamp"] = os.date("!%Y-%m-%dT%H:%M:%S.000Z")
+                }}
+            }
+
+            CachedStats.Level = currentLevel
+            CachedStats.EXP = currentEXP
+            CachedStats.Screws = currentScrews
+            CachedStats.Gears = currentGears
+            CachedStats.SIN = currentSIN
+            saveCachedAttributes(CachedStats)
+
+            httpRequest({
+                Url = Config.WebhookURL,
+                Method = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = HttpService:JSONEncode(embedData)
+            })
+        end)
+    end)
+end
+
+-- =========================================================================
+-- [10] SERVER HOPPING SYSTEM
+-- =========================================================================
+ServerHop = function()
+    if isHopping then return end
+    isHopping = true
+    Notify("GanKunZ", "📡 Mencari server 1-3 player...", 3)
+
+    if Config.AutoExecuteOnHop then
+        safeQueueOnTeleport(SCRIPT_LOADSTRING)
+    end
+
+    local blacklisted = readBlacklistedServers()
+    local cursor = ""
+    local maxTries = 8
+    local currentTry = 0
+    local minP = Config.MinPlayers or 1
+    local maxP = Config.MaxPlayers or 3
+    local fallbackServer = nil
+
+    while currentTry < maxTries do
+        currentTry = currentTry + 1
+        local apiUrl = string.format(
+            "https://games.roblox.com/v1/games/%s/servers/Public?limit=100&sortOrder=Asc&excludeFullGames=true&cursor=%s",
+            tostring(PlaceId),
+            HttpService:UrlEncode(cursor)
+        )
+        local success, res = pcall(function()
+            return game:HttpGet(apiUrl)
+        end)
+        if success and res and #res > 0 then
+            local data
+            pcall(function()
+                data = HttpService:JSONDecode(res)
+            end)
+            if data and data.data then
+                for _, server in ipairs(data.data) do
+                    if server.id ~= CurrentJobId and not blacklisted[server.id] then
+                        local playersCount = server.playing or 0
+                        local maxAllowed = server.maxPlayers or 10
+                        if playersCount < maxAllowed then
+                            if playersCount >= minP and playersCount <= maxP then
+                                addServerToBlacklist(server.id)
+                                Notify("GanKunZ", string.format("📡 Teleport ke server: %d player", playersCount), 3)
+                                local tpSuccess = pcall(function()
+                                    TeleportService:TeleportToPlaceInstance(PlaceId, server.id, LocalPlayer)
+                                end)
+                                if not tpSuccess then
+                                    addServerToBlacklist(server.id)
+                                else
+                                    safeWait(5)
+                                    return
+                                end
+                            elseif not fallbackServer and playersCount < (maxAllowed - 1) then
+                                fallbackServer = server
+                            end
+                        end
+                    end
+                end
+                if data.nextPageCursor and data.nextPageCursor ~= "" then
+                    cursor = data.nextPageCursor
+                else
+                    break
+                end
+            end
+        end
+        safeWait(1)
+    end
+
+    if fallbackServer then
+        Notify("GanKunZ", string.format("📡 Teleport ke server cadangan: %d player", fallbackServer.playing or 0), 3)
+        addServerToBlacklist(fallbackServer.id)
+        local tpSuccess = pcall(function()
+            TeleportService:TeleportToPlaceInstance(PlaceId, fallbackServer.id, LocalPlayer)
+        end)
+        if tpSuccess then
+            safeWait(5)
+            return
+        end
+    end
+
+    Notify("GanKunZ", "⚠️ Server target penuh, mencoba server acak...", 3)
+    pcall(function()
+        TeleportService:Teleport(PlaceId, LocalPlayer)
+    end)
+    safeWait(4)
+    isHopping = false
+end
+
+TeleportService.TeleportInitFailed:Connect(function(player, teleportResult, errorMessage)
+    if player == LocalPlayer then
+        isHopping = false
+        TeleportQueued = false
+        Notify("GanKunZ", "Teleport gagal: " .. tostring(errorMessage), 3)
+        if CurrentJobId ~= "" then
+            addServerToBlacklist(CurrentJobId)
+        end
+        safeWait(2)
+        ServerHop()
+    end
+end)
+
+-- =========================================================================
+-- [11] FINISHLINE & ROLE DETECTION
+-- =========================================================================
+local function FindFinishline()
+    local targetPos = nil
+    pcall(function()
+        local map = Workspace:FindFirstChild("Map")
+        if not map then return nil end
+
+        for _, obj in ipairs(map:GetDescendants()) do
+            if obj:IsA("BasePart") or obj:IsA("Model") then
+                local name = tostring(obj.Name):lower()
+                if name:find("finish") or name == "finishline" or name == "fininshline" then
+                    if obj:IsA("BasePart") then
+                        targetPos = obj.Position
+                        return
+                    elseif obj:IsA("Model") and obj.PrimaryPart then
+                        targetPos = obj.PrimaryPart.Position
+                        return
+                    end
+                end
+            end
+        end
+
+        if map:FindFirstChild("Rooftop") or map:FindFirstChild("RooftopHitbox") then
+            targetPos = Vector3.new(1546.12, 152.21, -796.72)
+            return
+        end
+        if map:FindFirstChild("churchbell") then
+            targetPos = Vector3.new(760.98, -20.14, -78.48)
+            return
+        end
+        if map:FindFirstChild("HooksMeat") then
+            targetPos = Vector3.new(-947.9, 152.12, -7579.52)
+            return
+        end
+
+        local finishPart = map:FindFirstChild("FinishLine") or map:FindFirstChild("Finishline")
+        if finishPart and finishPart:IsA("BasePart") then
+            targetPos = finishPart.Position
+            return
+        end
+
+        targetPos = Vector3.new(3098.16, 454.04, -4918.74)
+    end)
+    return targetPos
+end
+
+local function GetPlayerRole()
+    local role = "Survivor"
+    pcall(function()
+        if LocalPlayer.Team then
+            local tName = tostring(LocalPlayer.Team.Name):lower()
+            if tName:find("killer") then role = "Killer" return end
+            if tName:find("survivor") then role = "Survivor" return end
+            if tName:find("spectator") then role = "Spectator" return end
+        end
+        local char = LocalPlayer.Character
+        if char then
+            local tag = char:FindFirstChild("Team") or char:FindFirstChild("Role")
+            if tag then
+                local val = tostring(tag.Value or tag.Name):lower()
+                if val:find("killer") then role = "Killer" return end
+                if val:find("survivor") then role = "Survivor" return end
+                if val:find("spectator") then role = "Spectator" return end
+            end
+        end
+    end)
+    return role
+end
+
+local function IsIntermissionOrLobby()
+    local rs = game:GetService("ReplicatedStorage")
+    local checkNames = {"Status", "State", "GameState", "RoundStatus", "GameStatus", "Timer", "RoundTime", "Intermission", "Round", "Match", "GameValues"}
+    for _, name in ipairs(checkNames) do
+        local obj = rs:FindFirstChild(name, true)
+        if obj and (obj:IsA("StringValue") or obj:IsA("IntValue") or obj:IsA("NumberValue")) then
+            local valStr = tostring(obj.Value):lower()
+            if valStr:find("intermission") or valStr:find("waiting") or valStr:find("starting") or valStr:find("lobby") or valStr:find("prepare") then
+                return true, tostring(obj.Value)
+            end
+        end
+    end
+
+    local pGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if pGui then
+        for _, desc in ipairs(pGui:GetDescendants()) do
+            if desc:IsA("TextLabel") and desc.Visible then
+                local txt = tostring(desc.Text or ""):lower()
+                if (txt:find("intermission") or txt:find("starting in") or txt:find("starts in") or txt:find("game start") or txt:find("round start") or txt:find("waiting for")) then
+                    return true, desc.Text
+                end
+            end
+        end
+    end
+
+    local lobby = Workspace:FindFirstChild("Lobby") or Workspace:FindFirstChild("SpawnLocation")
+    local char = LocalPlayer.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if lobby and hrp then
+        local lobbyPos = lobby:IsA("BasePart") and lobby.Position or (lobby:FindFirstChildWhichIsA("BasePart") and lobby:FindFirstChildWhichIsA("BasePart").Position)
+        if lobbyPos and (hrp.Position - lobbyPos).Magnitude < 130 then
+            return true, "Masih di Lobby"
+        end
+    end
+
+    return false, "In Match"
+end
+
+-- =========================================================================
+-- [12] DISABLE KILLER CHANCE WORKER
+-- =========================================================================
+safeSpawn(function()
+    while ScriptRunning do
+        if Config.DisableKillerChance then
+            pcall(function()
+                local remotes = ReplicatedStorage:FindFirstChild("Remotes") or ReplicatedStorage
+                local setKiller = remotes:FindFirstChild("SetKillerChance") or remotes:FindFirstChild("KillerChance")
+                if setKiller and setKiller:IsA("RemoteEvent") then
+                    setKiller:FireServer(0)
+                end
+            end)
+        end
+        safeWait(10)
+    end
+end)
+
+-- =========================================================================
+-- [13] STATUS UPDATE EVENT LISTENERS
+-- =========================================================================
+pcall(function()
+    local remotes = ReplicatedStorage:WaitForChild("Remotes", 5)
+    if remotes then
+        local statusEvent = remotes:WaitForChild("StatusUpdateEvent", 5)
+        if statusEvent and statusEvent:IsA("RemoteEvent") then
+            local conn = statusEvent.OnClientEvent:Connect(function(status)
+                if status == "IntermissionStarting" or status == "WaitingForPlayers" or status == "Intermission" then
+                    BeatSurvivorDone = false
+                    LastFinishPos = nil
+                end
+            end)
+            table.insert(ActiveConnections, conn)
+        end
+
+        local timeEvent = remotes:WaitForChild("TimeUpdateEvent", 5)
+        if timeEvent and timeEvent:IsA("RemoteEvent") then
+            local conn = timeEvent.OnClientEvent:Connect(function(timeVal)
+                if timeVal == "Round" or timeVal == "Starting" then
+                    BeatSurvivorDone = false
+                end
+            end)
+            table.insert(ActiveConnections, conn)
+        end
+    end
+end)
+
+-- =========================================================================
+-- [14] CORE AUTO FARMING LOOP
+-- =========================================================================
+safeSpawn(function()
+    while ScriptRunning do
+        if Config.AutoFarm then
+            local inIntermission, reason = IsIntermissionOrLobby()
+            if inIntermission then
+                Notify("GanKunZ", "⏳ Menunggu match (" .. tostring(reason) .. ")...", 3)
+                while inIntermission and Config.AutoFarm and ScriptRunning do
+                    safeWait(1)
+                    inIntermission, reason = IsIntermissionOrLobby()
+                end
+                if not Config.AutoFarm or not ScriptRunning then break end
+                Notify("GanKunZ", "🎮 Match dimulai! Mempersiapkan teleportasi...", 3)
+                safeWait(4)
+            end
+
+            local char = LocalPlayer.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                local currentRole = GetPlayerRole()
+                LastRole = currentRole
+
+                if currentRole == "Killer" and Config.HopIfKiller then
+                    Notify("GanKunZ", "⚠️ Terpilih sebagai Killer! Melakukan Server Hop...", 3)
+                    safeWait(1.5)
+                    ServerHop()
+                elseif currentRole == "Survivor" and not BeatSurvivorDone then
+                    BeatSurvivorDone = true
+                    local finishPos = FindFinishline()
+                    if finishPos then
+                        Notify("GanKunZ", "📍 Finish line ditemukan! Delay 6s aman...", 3)
+                        safeWait(6)
+
+                        if Config.AutoFarm and GetPlayerRole() == "Survivor" and hrp and hrp.Parent and ScriptRunning then
+                            Notify("GanKunZ", "🚀 Teleportasi ke garis finish!", 2)
+                            if Config.InstantFinish then
+                                hrp.CFrame = CFrame.new(finishPos + Vector3.new(0, 4, 0))
+                            else
+                                local dist = (hrp.Position - finishPos).Magnitude
+                                local dur = math.clamp(dist / math.max(Config.GateTweenSpeed, 50), 0.5, 4)
+                                local tween = TweenService:Create(hrp, TweenInfo.new(dur, Enum.EasingStyle.Linear), {
+                                    CFrame = CFrame.new(finishPos + Vector3.new(0, 4, 0))
+                                })
+                                tween:Play()
+                                tween.Completed:Wait()
+                            end
+
+                            pcall(function()
+                                local map = Workspace:FindFirstChild("Map")
+                                if map then
+                                    for _, obj in ipairs(map:GetDescendants()) do
+                                        if obj:IsA("BasePart") then
+                                            local nm = tostring(obj.Name):lower()
+                                            if nm:find("finish") or nm:find("escape") or nm:find("line") or nm == "hitbox" then
+                                                if (obj.Position - finishPos).Magnitude < 35 then
+                                                    local touchFunc = firetouchinterest or (getgenv and getgenv().firetouchinterest)
+                                                    if touchFunc then
+                                                        touchFunc(hrp, obj, 0)
+                                                        task.wait(0.05)
+                                                        touchFunc(hrp, obj, 1)
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end)
+
+                            LastFinishPos = finishPos
+                            Notify("GanKunZ", "✅ Berhasil escape ronde ini!", 3)
+                            SendWebhookNotification("🏆 Escape Berhasil (GanKunZ)", false)
+
+                            if Config.AutoHopAfterEscape then
+                                Notify("GanKunZ", "🌐 Auto Hop Server dalam 2.5 detik...", 3)
+                                safeWait(2.5)
+                                ServerHop()
+                            else
+                                safeSpawn(function()
+                                    local wStart = os.clock()
+                                    while (os.clock() - wStart) < 25 and ScriptRunning do
+                                        safeWait(1)
+                                        if GetPlayerRole() == "Spectator" then
+                                            Notify("GanKunZ", "👁️ Match selesai (Spectator)", 3)
+                                            return
+                                        end
+                                    end
+                                end)
+                            end
+                        end
+                    else
+                        BeatSurvivorDone = false
+                        Notify("GanKunZ", "⚠️ Mencari lokasi finish...", 2)
+                    end
+                end
+            end
+        end
+        safeWait(1)
+    end
+end)
+
+print("✅ GanKunZ Auto Farm Loaded (Anti-Duplicate Protected)")
+Notify("GanKunZ", "Script aktif! (Protected dari multi-execute)", 4)
