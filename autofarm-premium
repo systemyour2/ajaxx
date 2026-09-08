@@ -317,7 +317,7 @@ if ModernV2 and ModernV2.CreateWindow then
             Name = "GanKunZ",
             Title = "GanKunZ",
             Content = "Violence District",
-            Logo = "rbxassetid://76222344614410",
+            Logo = "rbxassetid://128768775087531",
             Color = Color3.fromRGB(168, 85, 247),
             ConfigFolder = "GanKunZConfigs",
             Search = false,
