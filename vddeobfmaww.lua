@@ -84,7 +84,7 @@ end
 local MenuIcon
 if ModernV2 and ModernV2.CreateMenuIcon then
     MenuIcon = ModernV2:CreateMenuIcon({
-        Image = "rbxassetid://95802749943553",
+        Image = "rbxassetid://128768775087531",
         Size = 48,
         IconColor = Color3.fromRGB(255, 255, 255),
         BGColor = Color3.fromRGB(20, 22, 27),
@@ -104,7 +104,7 @@ if ModernV2 then
         Uitransparent = 0.15,
         Size = UDim2.fromOffset(500, 320),
         Color = Color3.fromRGB(0, 170, 255),
-        Image = "95802749943553",
+        Image = "128768775087531",
         ShowUser = true,
         Search = true,
         ConfigEnabled = true,
@@ -138,7 +138,7 @@ if ModernV2 then
         Name = "Dashboard",
         Icon = "lucide:layout-dashboard",
         Content = "GanKunZ Hub Violence District Script",
-        DiscordInvite = "https://discord.gg/NMPadyXMa",
+        DiscordInvite = "https://discord.gg/",
           SupportedExecutors = { "Delta", "Synapse X", "Krnl", "Codex", "Arceus X" },
           UnsupportedExecutors = { "Roblox Studio" },
           Segments = {
